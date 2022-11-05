@@ -1,0 +1,596 @@
+#!/usr/bin/bash
+
+# ------------------------------------
+# Constants
+# ------------------------------------
+
+# --> Configurations <--
+
+# [ Partitions Config ]
+
+readonly DEVICE='/dev/vda'
+
+# [ LVM Config ]
+
+readonly DISK_PASSWORD='root'
+readonly DEVICE_MAPPER_NAME='lvm'
+readonly VOLUME_GROUP_NAME='volume'
+readonly SWAP_LV_SIZE='1GB'
+readonly ROOT_LV_SIZE='15GB'
+readonly HOME_LV_SIZE='+100%FREE'
+
+# ---> In Chroot <---
+
+# [ Time Zone Config ]
+
+readonly CONTINENT='America'
+readonly COUNTRY='Argentina'
+readonly CITY='Buenos_Aires' 
+
+# [ Localization Config ] 
+
+readonly CODIFICATION='UTF-8'
+readonly LANGS=('es_AR.UTF-8 UTF-8' 'es_AR ISO-8859-1')
+readonly KEYBOARD_LAYOUT='latam'
+
+# [ Network Config ]
+
+readonly HOSTNAME='grepmam'
+
+# [ Root password ]
+
+readonly ROOT_PASSWORD='toor'
+
+# [ User config ]
+
+readonly USERNAME='grepmam'
+readonly USER_PASSWORD='test'
+
+
+# --> DON'T TOUCH <--
+
+# LVM
+
+readonly DEVICE_MAPPER_ROOT='/dev/mapper'
+
+# Colors
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly RESET='\033[0m'
+
+
+# ------------------------------------
+#
+#          
+#
+# ------------------------------------
+
+
+function run {
+
+    pre_installation
+    [ $? -ne 0 ] && echo 'Something has gone wrong with the pre-installation.' && exit 1
+
+    installation
+    [ $? -ne 0 ] && echo 'Something went wrong in the installation.' && exit 1
+
+    configure_the_system
+    [ $? -ne 0 ] && echo 'Something went wrong in the system configuration.' && exit 1
+
+}
+
+
+# ------------------------------------
+#
+#          PRE-INSTALLATION
+#
+# ------------------------------------
+
+
+function pre_installation {
+
+
+    # ---- Verify the boot mode ---- 
+
+    check_boot_mode
+    [ $? -ne 0 ] && bootmode='msdos' || bootmode='efi'
+
+    
+    # ---- Partition the disks ---- 
+
+    echo -e "[${BLUE}*${RESET}] Creating partitions..."
+    create_partitions 
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to partition disks correctly" && return 1
+    echo -e "[${GREEN}+${RESET}] Partitions have been created"
+
+
+    # ---- Format the partitions ---- 
+
+    echo -e "[${BLUE}*${RESET}] Formatting boot partition..."
+    format_boot_partition
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to format boot partition correctly" && return 1
+    echo -e "[${GREEN}+${RESET}] Boot partition have been formatted"
+
+    echo -e "[${BLUE}*${RESET}] Formatting LUKS partition..."
+    format_luks_partition 
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to format LUKS Partition correctly" && return 1
+    echo -e "[${GREEN}+${RESET}] LUKS partition have been formatted"
+
+ 
+    # ---- Create LVM environment ----
+
+    echo -e "[${BLUE}*${RESET}] Unlocking LUKS Partitions..."
+    unlock_luks_partition
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to unlock LUKS partitions" && return 1
+    echo -e "[${GREEN}+${RESET}] LUKS partitions unlocked"
+
+    echo -e "[${BLUE}*${RESET}] Creating phisical volume..."
+    create_physical_volume
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to create phisical volume" && return 1
+    echo -e "[${GREEN}+${RESET}] Phisical volume have been created"
+
+    echo -e "[${BLUE}*${RESET}] Creating volume group..."
+    create_volume_group
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to create volume group" && return 1
+    echo -e "[${GREEN}+${RESET}] Volume group have been created"
+
+    echo -e "[${BLUE}*${RESET}] Creating logical volumes..."
+    create_logical_volumes
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to create logical volumes" && return 1
+    echo -e "[${GREEN}+${RESET}] Logical volumes have been created"
+
+
+    # ---- Format logical volumes ----
+
+    echo -e "[${BLUE}*${RESET}] Formatting logical volumes..."
+    format_logical_volumes
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to format logical volumes" && return 1
+    echo -e "[${GREEN}+${RESET}] Logical volumes have been formatted"
+
+    echo -e "[${BLUE}*${RESET}] Formatting swap logical volume..."
+    format_swap_logical_volume
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to format swap partition" && return 1
+    echo -e "[${GREEN}+${RESET}] Swap partition have been formatted"
+
+
+    # ---- Active Swap ----
+
+    enable_swap
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to enable swap" && return 1
+    echo -e "[${GREEN}+${RESET}] Swap have been activated"
+
+
+    # ---- Mount the file systems ----
+
+    echo -e "[${BLUE}*${RESET}] Mounting logical volumes..."
+    mount_logical_volumes 
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to mount logical volumes" && return 1
+    echo -e "[${GREEN}+${RESET}] Logical volumes mounted"
+
+}
+
+
+function check_boot_mode {
+
+    ls /sys/firmware/efi/efivars &>/dev/null
+
+}
+
+
+function create_partitions {
+
+    close_luks             # check for mounted partitions and unmount them
+
+    parted -s $DEVICE \
+        mklabel $([ "$bootmode" = 'efi' ] && echo 'efi' || echo 'msdos') \
+        mkpart primary ext4 1MiB 512MiB \
+        $([ "$bootmode" = 'efi' ] && set 1 esp on || set 1 boot on) \
+        mkpart primary ext4 512Mib 100% &>/dev/null
+
+}
+
+
+function close_luks {
+	
+	( \
+
+		umount -R /mnt && \
+		swapoff $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-swap && \
+		vgchange -a n $VOLUME_GROUP_NAME && \
+		cryptsetup close $DEVICE_MAPPER_NAME \
+	
+	) &>/dev/null
+
+}
+
+
+function format_boot_partition {
+
+    ( [ "$bootmode" = 'msdos' ] && mkfs.ext4 ${DEVICE}1 || mkfs.fat -F 32 ${DEVICE}1 ) &>/dev/null
+
+}
+
+
+function format_luks_partition {
+    
+    if [ ! "$DISK_PASSWORD" ]; then
+        read -sp "Enter disk password: " DISK_PASSWORD
+    fi
+
+    echo -ne $DISK_PASSWORD | cryptsetup --batch-mode luksFormat ${DEVICE}2 &>/dev/null
+
+}
+
+
+function unlock_luks_partition {
+
+    echo $DISK_PASSWORD | cryptsetup open --type luks ${DEVICE}2 $DEVICE_MAPPER_NAME &>/dev/null
+
+}
+
+
+function create_physical_volume {
+
+    pvcreate $DEVICE_MAPPER_ROOT/$DEVICE_MAPPER_NAME &>/dev/null
+
+}
+
+
+function create_volume_group {
+
+    vgcreate $VOLUME_GROUP_NAME $DEVICE_MAPPER_ROOT/$DEVICE_MAPPER_NAME &>/dev/null
+
+}
+
+
+function create_logical_volumes {
+    
+    ( \
+
+        lvcreate --size $SWAP_LV_SIZE $VOLUME_GROUP_NAME --name swap && \
+        lvcreate --size $ROOT_LV_SIZE $VOLUME_GROUP_NAME --name root && \
+        lvcreate --extents $HOME_LV_SIZE $VOLUME_GROUP_NAME --name home \
+
+    ) &>/dev/null
+
+}
+
+
+function format_logical_volumes {
+
+    ( \
+
+        mkfs.ext4 $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-root && \
+        mkfs.ext4 $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-home \
+
+    ) &>/dev/null
+
+}
+
+
+function format_swap_logical_volume {
+
+    mkswap $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-swap &>/dev/null
+
+}
+
+
+function enable_swap {
+
+    swapon $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-swap &>/dev/null
+
+}
+
+
+function mount_logical_volumes {
+
+    ( \
+
+        mount $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-root /mnt && \
+        mkdir /mnt/home && \
+        mount $DEVICE_MAPPER_ROOT/${VOLUME_GROUP_NAME}-home /mnt/home && \
+        mkdir /mnt/boot && \
+        mount ${DEVICE}1 /mnt/boot  \
+
+    ) &>/dev/null
+
+}
+
+
+# ------------------------------------
+#
+#            INSTALLATION
+#
+# ------------------------------------
+
+
+function installation {
+
+    #set_mirrors 
+
+    echo -e "[${BLUE}*${RESET}] Installing essential packages..."
+    install_essential_packages
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to install essential packages" && return 1
+    echo -e "[${GREEN}+${RESET}] Essential packages installed"
+
+}
+
+
+function set_mirrors {
+
+    echo 'none'
+
+}
+
+
+function install_essential_packages {
+
+    pacstrap /mnt base linux linux-firmware base-devel &>/dev/null
+
+}
+
+
+# ------------------------------------
+#
+#         CONFIGURE THE SYSTEM
+#
+# ------------------------------------
+
+
+function configure_the_system {
+
+    create_fstab
+    echo -e "[${GREEN}+${RESET}] Fstab file created"
+    
+    change_to_chroot
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] A problem has occurred in the cage" && return 1
+
+    finish_installation
+
+    return 0
+
+}
+
+
+function create_fstab {
+
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+}
+
+
+function change_to_chroot {
+
+    local program=$0
+
+    cp $program /mnt/setup 
+    arch-chroot /mnt ./setup chroot $bootmode
+
+} 
+
+
+function finish_installation {
+
+	umount -R /mnt
+	reboot
+
+}
+
+
+# ------------------------------------
+#
+#              ON CHROOT
+#
+# ------------------------------------
+
+
+function run_chroot {
+
+    echo -e "[!] In Chroot"
+
+
+    setup_time_zone
+    echo -e "[${GREEN}+${RESET}] Configured time zone"
+
+
+    setup_localization
+    echo -e "[${GREEN}+${RESET}] Configured localization"
+
+
+    setup_network
+    echo -e "[${GREEN}+${RESET}] Configured network"
+
+
+    recreate_initramfs
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to recreate initramfs" && return 1
+    echo -e "[${GREEN}+${RESET}] initramfs recreated"
+
+    echo -e "[-] Waiting to enter root password"
+    setup_root 
+    echo -e "[${GREEN}+${RESET}] Root password updated"
+
+    echo -e "[-] Waiting to enter user password"
+    setup_user
+    echo -e "[${GREEN}+${RESET}] User created and user password updated"   
+
+
+    setup_boot_manager
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to configurate boot manager" && return 1
+    echo -e "[${GREEN}+${RESET}] Boot manager configured"
+
+
+    install_microcodes
+    [ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to install microcodes" && return 1
+    echo -e "[${GREEN}+${RESET}] Microcodes installed"
+
+
+	install_desktop_environment
+	[ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to install Desktop Environment" && return 1
+	echo -e "[${GREEN}+${RESET}] Desktop environment installed"
+
+
+	install_additional_packages
+	[ $? -ne 0 ] && echo -e "[${RED}x${RESET}] Failed to install additional packages" && return 1
+	echo -e "[${GREEN}+${RESET}] Additional packages installed"
+
+}
+
+
+function setup_time_zone {
+
+    ln --symbolic --force /usr/share/zoneinfo/$CONTINENT/$COUNTRY/$CITY /etc/localtime &>/dev/null
+    hwclock --systohc
+
+}
+
+
+function setup_localization {
+
+    for LANG in "${LANGS[@]}"; do
+        echo -n "$LANG\n" > /etc/locale.gen
+    done
+
+    locale-gen &> /dev/null
+    echo -n "LANG=${LANGS[0]}" > /etc/locale.conf
+    echo -n "KEYMAP=$KEYBOARD_LAYOUT" > /etc/vconsole.conf
+
+}
+
+
+function setup_network {
+
+    pacman -S networkmanager wpa_supplicant wireless_tools netctl iwd dhcpcd --noconfirm &>/dev/null
+
+    [ $? -eq 0 ] && systemctl enable NetworkManager &>/dev/null
+
+    echo -n "$HOSTNAME" > /etc/hostname
+    echo -ne "127.0.0.1 localhost\n::1 localhost\n127.0.0.1 ${HOSTNAME}.localdomain $HOSTNAME" > /etc/hosts 
+
+}
+
+
+function recreate_initramfs {
+
+    pacman --sync lvm2 --noconfirm &>/dev/null
+
+    if [ $? -eq 0 ]; then
+
+        local hooks='base udev autodetect modconf block keyboard encrypt lvm2 filesystems fsck'
+        sed -i "s/^HOOKS=.*/HOOKS=($hooks)/g" /etc/mkinitcpio.conf
+        mkinitcpio -p linux &>/dev/null
+
+    fi
+
+}
+
+
+function setup_root {
+
+    #if [ ! "$ROOT_PASSWORD" ]; then
+    #    read -sp "Enter root password: " ROOT_PASSWORD 
+    #fi
+
+    #setup_password $ROOT_PASSWORD
+
+    passwd root
+	
+}
+
+
+function setup_user {
+
+    #if [ ! "$USER_PASSWORD" ]; then
+    #    read -sp "Enter user password: " USER_PASSWORD
+    #fi
+
+    useradd --create-home --groups wheel,video,audio,optical --badnames $USERNAME #&& setup_password $USER_PASSWORD 
+
+    passwd $USERNAME 
+
+    # --> need to add privilege configuration
+
+}
+
+
+function setup_password {
+
+	local password=$1
+
+	echo -ne "$password\n$password" | passwd &>/dev/null
+
+}
+
+
+function setup_boot_manager {
+
+    if [ "$bootmode" = 'msdos' ]; then
+
+        pacman --sync grub --noconfirm &>/dev/null
+
+        sed -i "s~GRUB_CMDLINE_LINUX=.*~GRUB_CMDLINE_LINUX=\"cryptdevice=${DEVICE}2:$DEVICE_MAPPER_NAME\"~" /etc/default/grub
+        sed -i "s/^#GRUB_ENABLE_CRYPTODISK=y/GRUB_ENABLE_CRYPTODISK=y/" /etc/default/grub
+
+        grub-install --target=i386-pc $DEVICE &> /dev/null
+        grub-mkconfig -o /boot/grub/grub.cfg 
+    
+    else
+
+        pacman --sync grub efibootmgr dosfstools mtools --noconfirm &>/dev/null
+        
+        sed -i "s~^GRUB_CMDLINE_LINUX=.*~GRUB_CMDLINE_LINUX=\"cryptdevice=${DEVICE}3:$DEVICE_MAPPER_NAME\"~" /etc/default/grub
+        sed -i "s/^#GRUB_ENABLE_CRYPTODISK=y/GRUB_ENABLE_CRYPTODISK=y/" /etc/default/grub
+
+        EFI_PATH=/boot/EFI
+
+        mkdir $EFI_PATH
+        mount ${DEVICE}1 $EFI_PATH
+        grub-install --target=x86_64-efi --bootloader-id="Arch Linux" --efi-directory=$EFI_PATH --recheck &> /dev/null
+        grub-mkconfig -o /boot/grub/grub.cfg
+
+    fi
+
+}
+
+
+function install_microcodes {
+
+    processor=$(grep --only-matching --ignore-case --extended-regexp "Intel|AMD" /proc/cpuinfo | head --lines 1)
+
+    case "$processor" in
+
+        Intel) pacman --sync intel-ucode --noconfirm &>/dev/null;;
+
+        AMD) pacman --sync amd-ucode --noconfirm &>/dev/null;;
+
+        *) ;;
+
+	esac
+
+}
+
+
+function install_desktop_environment {
+
+	(pacman -Syu i3 i3status xorg lightdm lightdm-gtk-greeter --noconfirm && systemctl enable lightdm) &> /dev/null
+
+}
+
+
+function install_additional_packages {
+
+	(pacman -Syu terminator firefox ttf-font-awesome ttf-droid mpv picom git python python-pip vim --noconfirm) &> /dev/null
+
+}
+
+
+
+# Main
+
+environment=$1
+bootmode=$2
+
+export bootmode
+
+[ "$environment" = 'chroot' ] && run_chroot || run
