@@ -30,7 +30,7 @@ readonly CITY='Buenos_Aires'
 # [ Localization Config ] 
 
 readonly CODIFICATION='UTF-8'
-readonly LANGS=('es_AR.UTF-8 UTF-8' 'es_AR ISO-8859-1')
+readonly LANGS=('es_AR.UTF-8 UTF-8' 'es_AR UTF-8')
 readonly KEYBOARD_LAYOUT='latam'
 
 # [ Network Config ]
