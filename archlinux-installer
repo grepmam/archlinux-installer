@@ -320,7 +320,7 @@ function installation {
 
 function set_mirrors {
 
-    echo 'none'
+    echo 'none' # check some day :)
 
 }
 
